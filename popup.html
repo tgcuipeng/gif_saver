@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>图片批量保存</title>
+  <style>
+    body {
+      width: 280px;
+      padding: 14px;
+      margin: 0;
+      font-family: Arial, sans-serif;
+    }
+
+    button {
+      width: 100%;
+      padding: 10px;
+      font-size: 14px;
+      cursor: pointer;
+      background: #4285f4;
+      color: white;
+      border: none;
+      border-radius: 4px;
+    }
+
+    button:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+
+    #status {
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #333;
+      white-space: pre-wrap;
+    }
+
+    .panel {
+      margin-top: 10px;
+      border: 1px solid #e2e2e2;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fafafa;
+    }
+
+    .panel-title {
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: #333;
+    }
+
+    .format-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px 8px;
+    }
+
+    .format-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #333;
+    }
+
+    .size-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #333;
+      margin-top: 8px;
+    }
+
+    #minSizeInput,
+    #maxCountInput,
+    #maxSingleKBInput {
+      width: 70px;
+      height: 24px;
+      border: 1px solid #c8c8c8;
+      border-radius: 4px;
+      padding: 0 6px;
+      font-size: 12px;
+    }
+
+    .hint {
+      margin-top: 6px;
+      font-size: 11px;
+      color: #666;
+      line-height: 1.4;
+    }
+
+    .subhint {
+      opacity: 0.75;
+    }
+
+    .column-row {
+      margin-top: 8px;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      font-size: 12px;
+      color: #333;
+    }
+
+    .column-label {
+      margin-right: 2px;
+      font-weight: 700;
+    }
+
+    .column-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .column-options {
+      margin-top: 4px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+  </style>
+</head>
+<body>
+  <button id="saveBtn">保存</button>
+  <div class="panel">
+    <div class="panel-title">图片格式（可多选）</div>
+    <div class="format-grid">
+      <label class="format-item"><input type="checkbox" id="fmt_gif" value="gif">GIF</label>
+      <label class="format-item"><input type="checkbox" id="fmt_jpg" value="jpg">JPG</label>
+      <label class="format-item"><input type="checkbox" id="fmt_png" value="png">PNG</label>
+      <label class="format-item"><input type="checkbox" id="fmt_webp" value="webp">WEBP</label>
+    </div>
+    <label class="size-row">
+      <input type="checkbox" id="minSizeEnabled">
+      文件大于
+      <input id="minSizeInput" type="number" min="1" max="307200" step="1" value="200">
+      K
+    </label>
+    <div class="column-row">
+      <span class="column-label">排版列数:</span>
+      <div class="column-options">
+        <label class="column-item"><input type="radio" name="layoutColumns" id="col_1" value="1">1列</label>
+        <label class="column-item"><input type="radio" name="layoutColumns" id="col_2" value="2">2列</label>
+        <label class="column-item"><input type="radio" name="layoutColumns" id="col_3" value="3">3列</label>
+        <label class="column-item"><input type="radio" name="layoutColumns" id="col_4" value="4">4列</label>
+      </div>
+    </div>
+    <label class="size-row">
+      本次最多
+      <input id="maxCountInput" type="number" min="1" max="2000" step="1" value="250">
+      张
+    </label>
+    <label class="size-row">
+      单张上限
+      <input id="maxSingleKBInput" type="number" min="0" max="512" step="1" value="5">
+      M<span class="subhint">（0=不限制）</span>
+    </label>
+    <div class="hint">默认仅 GIF；「文件大于」为过滤过小图；「本次最多/单张上限」防止一次导出过大。设置会自动记住。</div>
+  </div>
+  <div id="status">准备就绪</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

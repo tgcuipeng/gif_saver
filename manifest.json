@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "SingleHTML",
+  "version": "1.2.1",
+  "description": "从当前网页收集图片，按格式与大小筛选后，导出为单个 HTML（内嵌图片），可选列数排版。",
+  "permissions": ["activeTab", "downloads", "scripting", "tabs", "storage", "offscreen"],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

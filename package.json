@@ -1,0 +1,15 @@
+{
+  "name": "gif_saver",
+  "version": "1.0.0",
+  "main": "background.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@hazae41/base64.wasm": "^1.0.12"
+  }
+}
