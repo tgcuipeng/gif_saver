@@ -75,7 +75,8 @@
 
     #minSizeInput,
     #maxCountInput,
-    #maxSingleKBInput {
+    #maxSingleKBInput,
+    #httpTimeoutMinutesInput {
       width: 70px;
       height: 24px;
       border: 1px solid #c8c8c8;
@@ -158,6 +159,11 @@
       单张上限
       <input id="maxSingleKBInput" type="number" min="0" max="512" step="1" value="5">
       M<span class="subhint">（0=不限制）</span>
+    </label>
+    <label class="size-row">
+      单张超时
+      <input id="httpTimeoutMinutesInput" type="number" min="1" max="30" step="1" value="1">
+      分钟
     </label>
     <div class="hint">默认仅 GIF；「文件大于」为过滤过小图；「本次最多/单张上限」防止一次导出过大。设置会自动记住。</div>
   </div>

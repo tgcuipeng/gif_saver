@@ -1,6 +1,10 @@
 const EXPORT_DB_NAME = 'singlehtml_export_db';
 const EXPORT_STORE_NAME = 'pending_exports';
 
+function logOffscreen(...args) {
+  console.log('[gif_saver][offscreen]', ...args);
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.target !== 'offscreen') {
     return false;
@@ -12,13 +16,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (!exportId) {
         throw new Error('无效的导出标识。');
       }
+      logOffscreen('create-export-blob-url', exportId);
       const blob = await getPendingExportBlob(exportId);
       if (!blob) {
         throw new Error('临时导出内容不存在或已过期。');
       }
       const blobUrl = URL.createObjectURL(blob);
+      logOffscreen('blob url ok', { exportId, size: blob.size });
       sendResponse({ ok: true, blobUrl });
     })().catch((error) => {
+      logOffscreen('create-export-blob-url failed', error);
       sendResponse({
         ok: false,
         error: error?.message || String(error)
@@ -29,6 +36,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message?.type === 'revoke-export-blob-url') {
     const blobUrl = String(message?.blobUrl || '');
+    logOffscreen('revoke-export-blob-url', blobUrl.slice(0, 48));
     if (blobUrl) {
       try {
         URL.revokeObjectURL(blobUrl);

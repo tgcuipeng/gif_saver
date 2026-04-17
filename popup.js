@@ -4,6 +4,7 @@ const minSizeEnabledEl = document.getElementById('minSizeEnabled');
 const minSizeInputEl = document.getElementById('minSizeInput');
 const maxCountInputEl = document.getElementById('maxCountInput');
 const maxSingleKBInputEl = document.getElementById('maxSingleKBInput');
+const httpTimeoutMinutesInputEl = document.getElementById('httpTimeoutMinutesInput');
 const columnRadios = [
   document.getElementById('col_1'),
   document.getElementById('col_2'),
@@ -25,10 +26,12 @@ const DEFAULT_SETTINGS = {
   minSizeKB: 200,
   layoutColumns: 1,
   maxImageCount: 250,
-  maxSingleImageMB: 5
+  maxSingleImageMB: 5,
+  httpTimeoutMinutes: 1
 };
 
 init().catch((error) => {
+  logPopup('init failed', error);
   setBusy(false, `初始化失败：${humanizeErrorMessage(error)}`);
 });
 
@@ -51,7 +54,7 @@ saveBtn.addEventListener('click', async () => {
       `任务已提交，后台将按格式(${options.formats.join('/')})和大小阈值(${minText})处理...`
     );
 
-    const response = await chrome.runtime.sendMessage({
+    const payload = {
       type: 'export-gifs',
       tabId: tab.id,
       outputFileName: defaultFileName,
@@ -61,12 +64,25 @@ saveBtn.addEventListener('click', async () => {
       minSizeKB: options.minSizeKB,
       layoutColumns: options.layoutColumns,
       maxImageCount: options.maxImageCount,
-      maxSingleImageKB: options.maxSingleImageMB > 0 ? mbToKb(options.maxSingleImageMB) : 0
+      maxSingleImageKB: options.maxSingleImageMB > 0 ? mbToKb(options.maxSingleImageMB) : 0,
+      httpTimeoutMinutes: options.httpTimeoutMinutes
+    };
+    logPopup('sendMessage export-gifs', {
+      tabId: payload.tabId,
+      httpTimeoutMinutes: payload.httpTimeoutMinutes,
+      formats: payload.selectedFormats
     });
+    const response = await chrome.runtime.sendMessage(payload);
 
     if (!response?.ok) {
+      logPopup('export-gifs response error', response);
       throw new Error(response?.error || '后台处理失败。');
     }
+    logPopup('export-gifs ok', {
+      matchedCount: response.matchedCount,
+      embeddedCount: response.embeddedCount,
+      failedCount: response.failedCount
+    });
 
     const {
       outputFileName: finalFileName,
@@ -83,12 +99,14 @@ saveBtn.addEventListener('click', async () => {
       `完成：命中 ${matchedCount} 个，内嵌成功 ${embeddedCount} 个，失败 ${failedCount} 个。\n已保存 ${finalFileName}${limitHint}`
     );
   } catch (error) {
+    logPopup('save flow error', error);
     setBusy(false, `执行失败：${humanizeErrorMessage(error)}`);
   }
 });
 
 async function init() {
   const saved = await loadOptions();
+  logPopup('options loaded', saved);
   applyOptionsToUi(saved);
   bindOptionEvents();
   setBusy(false, '准备就绪');
@@ -143,6 +161,7 @@ function bindOptionEvents() {
   };
   debouncePersist(normalizeMaxImageCount, maxCountInputEl);
   debouncePersist(normalizeMaxSingleImageMB, maxSingleKBInputEl);
+  debouncePersist(normalizeHttpTimeoutMinutes, httpTimeoutMinutesInputEl);
 
   maxCountInputEl.addEventListener('change', async () => {
     maxCountInputEl.value = String(normalizeMaxImageCount(maxCountInputEl.value));
@@ -150,6 +169,12 @@ function bindOptionEvents() {
   });
   maxSingleKBInputEl.addEventListener('change', async () => {
     maxSingleKBInputEl.value = String(normalizeMaxSingleImageMB(maxSingleKBInputEl.value));
+    await persistCurrentOptions();
+  });
+  httpTimeoutMinutesInputEl.addEventListener('change', async () => {
+    httpTimeoutMinutesInputEl.value = String(
+      normalizeHttpTimeoutMinutes(httpTimeoutMinutesInputEl.value)
+    );
     await persistCurrentOptions();
   });
 }
@@ -161,7 +186,8 @@ function collectCurrentOptions() {
     minSizeKB: normalizeMinSizeKB(minSizeInputEl.value),
     layoutColumns: getSelectedLayoutColumns(),
     maxImageCount: normalizeMaxImageCount(maxCountInputEl.value),
-    maxSingleImageMB: normalizeMaxSingleImageMB(maxSingleKBInputEl.value)
+    maxSingleImageMB: normalizeMaxSingleImageMB(maxSingleKBInputEl.value),
+    httpTimeoutMinutes: normalizeHttpTimeoutMinutes(httpTimeoutMinutesInputEl.value)
   };
 }
 
@@ -191,6 +217,9 @@ function applyOptionsToUi(options) {
 
   maxCountInputEl.value = String(normalizeMaxImageCount(options.maxImageCount));
   maxSingleKBInputEl.value = String(normalizeMaxSingleImageMB(options.maxSingleImageMB));
+  httpTimeoutMinutesInputEl.value = String(
+    normalizeHttpTimeoutMinutes(options.httpTimeoutMinutes ?? DEFAULT_SETTINGS.httpTimeoutMinutes)
+  );
 }
 
 async function persistCurrentOptions() {
@@ -213,6 +242,9 @@ async function loadOptions() {
     maxImageCount: normalizeMaxImageCount(raw.maxImageCount ?? DEFAULT_SETTINGS.maxImageCount),
     maxSingleImageMB: normalizeMaxSingleImageMB(
       raw.maxSingleImageMB ?? DEFAULT_SETTINGS.maxSingleImageMB
+    ),
+    httpTimeoutMinutes: normalizeHttpTimeoutMinutes(
+      raw.httpTimeoutMinutes ?? DEFAULT_SETTINGS.httpTimeoutMinutes
     )
   };
 }
@@ -258,6 +290,15 @@ function normalizeMaxSingleImageMB(value) {
   return Math.min(num, 512);
 }
 
+/** 单次 HTTP 连接阶段超时（分钟），范围 1–30 */
+function normalizeHttpTimeoutMinutes(value) {
+  const num = Number.parseInt(String(value), 10);
+  if (Number.isNaN(num) || num < 1) {
+    return DEFAULT_SETTINGS.httpTimeoutMinutes;
+  }
+  return Math.min(num, 30);
+}
+
 function mbToKb(mb) {
   const num = Number.parseInt(String(mb), 10);
   if (Number.isNaN(num) || num <= 0) {
@@ -272,6 +313,7 @@ function setBusy(busy, message) {
   minSizeInputEl.disabled = busy || !minSizeEnabledEl.checked;
   maxCountInputEl.disabled = busy;
   maxSingleKBInputEl.disabled = busy;
+  httpTimeoutMinutesInputEl.disabled = busy;
   Object.values(formatCheckboxes).forEach((checkbox) => {
     checkbox.disabled = busy;
   });
@@ -303,6 +345,10 @@ function buildDefaultFileNameByTitle(title) {
     return `image_export_${createTimestamp()}.html`;
   }
   return `${cleaned}.html`;
+}
+
+function logPopup(...args) {
+  console.log('[gif_saver][popup]', ...args);
 }
 
 function humanizeErrorMessage(error) {

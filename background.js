@@ -1,7 +1,7 @@
 import { Base64Wasm, Memory, base64_encode_padded } from './node_modules/@hazae41/base64.wasm/dist/esm/node/index.mjs';
 
+/** 并发扫描/拉取路数；每一路在同一条异步链上完成 fetch + WASM Base64，不经过全局编码队列 */
 const MAX_CONCURRENT_DOWNLOADS = 5;
-const MAX_CONCURRENT_ENCODINGS = 1;
 /** WASM Base64 分块编码，避免超大缓冲区一次性编码失败（必须是 3 的倍数） */
 const WASM_BASE64_CHUNK_BYTES = 3 * 1024 * 1024;
 const EXPORT_DB_NAME = 'singlehtml_export_db';
@@ -31,9 +31,45 @@ const TAB_CURRENT_TASK = new Map();
 const OVERLAY_THROTTLE_MS = 1500;
 const overlayLastShownAt = new Map();
 let wasmInitPromise = null;
-let encodingQueueTail = Promise.resolve();
-let activeEncodingCount = 0;
 const DOWNLOAD_EXPORT_CLEANUPS = new Map();
+/** 按域名+状态码节流：避免大量失败 fetch 刷屏控制台 */
+const FETCH_NOT_OK_LOG_HOST_STATUS_LIMIT = 5;
+const FETCH_NOT_OK_LOG_COOLDOWN_MS = 60 * 1000;
+const fetchNotOkLogStateByHostStatus = new Map();
+
+function logBg(...args) {
+  console.log('[gif_saver][sw]', ...args);
+}
+
+function getHostSafe(url) {
+  try {
+    return new URL(url).host || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function logFetchNotOkThrottled(url, status, connectMs) {
+  const host = getHostSafe(url);
+  const key = `${status}:${host}`;
+  const now = Date.now();
+  const state = fetchNotOkLogStateByHostStatus.get(key) || {
+    count: 0,
+    lastLoggedAt: 0
+  };
+  state.count += 1;
+
+  const shouldLog =
+    state.count <= FETCH_NOT_OK_LOG_HOST_STATUS_LIMIT || now - state.lastLoggedAt >= FETCH_NOT_OK_LOG_COOLDOWN_MS;
+
+  if (shouldLog) {
+    fetchNotOkLogStateByHostStatus.set(key, { ...state, lastLoggedAt: now });
+    logBg('fetch not ok', { url: shortUrl(url), status, connectMs, host, hitCount: state.count });
+    return;
+  }
+
+  fetchNotOkLogStateByHostStatus.set(key, state);
+}
 
 // Service worker 唤醒时主动清理一轮过期导出缓存，缩短异常残留时间。
 pruneExpiredExportRecords().catch(() => {
@@ -65,6 +101,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'cancel-export-task') {
     const taskId = String(message?.taskId || '');
     if (taskId) {
+      logBg('cancel-export-task', taskId);
       cancelTask(taskId);
     }
     sendResponse({ ok: true });
@@ -76,6 +113,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   const taskId = createTaskId();
+  logBg('export-gifs message', { taskId, tabId: message?.tabId, httpTimeoutMinutes: message?.httpTimeoutMinutes });
   const targetTabId = Number(message?.tabId);
   if (Number.isInteger(targetTabId)) {
     const prevTaskId = TAB_CURRENT_TASK.get(targetTabId);
@@ -88,6 +126,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const taskContext = createTaskContext(taskId);
   handleExportRequest({ ...message, taskId }, taskContext)
     .then(async (result) => {
+      logBg('export finished', { taskId, ...result });
       if (Number.isInteger(targetTabId)) {
         const extra =
           result.skippedOverLimit > 0 ? `，另有 ${result.skippedOverLimit} 个超出单次上限未处理` : '';
@@ -100,6 +139,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ ok: true, ...result });
     })
     .catch(async (error) => {
+      logBg('export failed', { taskId, message: error?.message, stack: error?.stack });
       if (error?.message === TASK_CANCELED_ERROR) {
         sendResponse({
           ok: false,
@@ -148,6 +188,17 @@ async function handleExportRequest(message, taskContext) {
   const maxImageCount = normalizeMaxImageCount(message?.maxImageCount);
   const maxSingleImageKB = normalizeMaxSingleImageKB(message?.maxSingleImageKB);
   const maxSingleBytes = maxSingleImageKB > 0 ? maxSingleImageKB * 1024 : 0;
+  const httpTimeoutMinutes = normalizeHttpTimeoutMinutes(message?.httpTimeoutMinutes);
+  const httpTimeoutMs = httpTimeoutMinutes * 60 * 1000;
+
+  logBg('handleExportRequest start', {
+    taskId: message.taskId,
+    tabId,
+    httpTimeoutMinutes,
+    httpTimeoutMs,
+    formats: selectedFormats,
+    maxImageCount
+  });
 
   if (!outputFileName) {
     throw new Error('文件名为空。');
@@ -164,13 +215,19 @@ async function handleExportRequest(message, taskContext) {
   throwIfCancelled(taskContext);
   const sourceCandidates =
     candidates || (Number.isInteger(tabId) ? await collectCandidatesFromTab(tabId) : []);
-  const normalizedCandidates = Array.from(
-    new Set(
-      sourceCandidates
-        .map((url) => String(url || '').trim())
-        .filter((url) => HTTP_URL_REGEXP.test(url))
-    )
-  );
+  logBg('candidates collected', { taskId: message.taskId, rawCount: sourceCandidates.length });
+  /** 页面/入参顺序，允许同一 URL 多处出现（仅对「拉取」去重，展开时仍按此处索引） */
+  const orderedCandidateUrls = sourceCandidates
+    .map((url) => String(url || '').trim())
+    .filter((url) => HTTP_URL_REGEXP.test(url));
+  /** 去重仅用于网络拉取，顺序为首次出现顺序 */
+  const uniqueUrlsForFetch = dedupeUrlsFirstSeenOrder(orderedCandidateUrls);
+
+  logBg('candidates prepared', {
+    taskId: message.taskId,
+    orderedSlots: orderedCandidateUrls.length,
+    uniqueFetchUrls: uniqueUrlsForFetch.length
+  });
 
   throwIfCancelled(taskContext);
   let matchedCount = 0;
@@ -179,24 +236,61 @@ async function handleExportRequest(message, taskContext) {
     await showTaskOverlay(tabId, {
       taskId: message.taskId,
       status: 'running',
-      text: `正在扫描 0/${normalizedCandidates.length} 个链接，命中 0 个，失败 0 个`
+      text: `准备拉取 0/${uniqueUrlsForFetch.length} 个链接（共 ${orderedCandidateUrls.length} 处引用）`
     });
   }
   const matchedEntries = [];
-  const urlTaskCache = new Map();
-  let scannedCount = 0;
   let matchedFoundCount = 0;
   const progressStep = 10;
 
-  await runWithConcurrency(normalizedCandidates, MAX_CONCURRENT_DOWNLOADS, async (url, currentIndex) => {
-    if (taskContext?.canceled) {
-      return;
+  let fetchCompleted = 0;
+  /** 拉取阶段按「唯一 URL」统计命中，用于进度条（展开后的槽位数在后面再算） */
+  let interimUniqueMatched = 0;
+  const uniqueResults = await runWithConcurrency(
+    uniqueUrlsForFetch,
+    MAX_CONCURRENT_DOWNLOADS,
+    async (url) => {
+      if (taskContext?.canceled) {
+        return { matched: false, format: null, embed: null };
+      }
+      const result = await fetchMatchedImageAsDataUrl(
+        url,
+        selectedFormats,
+        minSizeBytes,
+        maxSingleBytes,
+        httpTimeoutMs,
+        taskContext
+      );
+      fetchCompleted += 1;
+      if (result?.matched) {
+        interimUniqueMatched += 1;
+      }
+      if (
+        Number.isInteger(tabId) &&
+        (fetchCompleted === uniqueUrlsForFetch.length || fetchCompleted % progressStep === 0)
+      ) {
+        await showTaskOverlay(tabId, {
+          taskId: message.taskId,
+          status: 'running',
+          text: `拉取链接 ${fetchCompleted}/${uniqueUrlsForFetch.length}（${orderedCandidateUrls.length} 处引用），链命中 ${interimUniqueMatched} 个`
+        });
+      }
+      return result;
     }
-    const result = await getOrCreateTaskCache(urlTaskCache, url, () =>
-      fetchMatchedImageAsDataUrl(url, selectedFormats, minSizeBytes, maxSingleBytes, taskContext)
-    );
+  );
 
-    scannedCount += 1;
+  const urlToResult = new Map();
+  uniqueUrlsForFetch.forEach((url, i) => {
+    urlToResult.set(url, uniqueResults[i]);
+  });
+
+  throwIfCancelled(taskContext);
+  for (let currentIndex = 0; currentIndex < orderedCandidateUrls.length; currentIndex += 1) {
+    const url = orderedCandidateUrls[currentIndex];
+    const result = urlToResult.get(url);
+    if (!result) {
+      continue;
+    }
     if (result?.matched) {
       matchedFoundCount += 1;
       matchedEntries.push({
@@ -206,32 +300,46 @@ async function handleExportRequest(message, taskContext) {
         embed: result.embed || null
       });
     }
+  }
 
-    if (
-      Number.isInteger(tabId) &&
-      (scannedCount === normalizedCandidates.length || scannedCount % progressStep === 0)
-    ) {
-      const cappedMatched = Math.min(matchedFoundCount, maxImageCount);
-      const liveSorted = matchedEntries.slice().sort((a, b) => a.domIndex - b.domIndex);
-      const liveSelected = liveSorted.slice(0, maxImageCount);
-      const liveFailed = liveSelected.filter((entry) => !entry.embed).length;
-      const liveTruncated = Math.max(0, matchedFoundCount - maxImageCount);
-      const extra = liveTruncated > 0 ? `（已忽略超出 ${liveTruncated} 个）` : '';
-      await showTaskOverlay(tabId, {
-        taskId: message.taskId,
-        status: 'running',
-        text: `正在扫描 ${scannedCount}/${normalizedCandidates.length} 个链接，命中 ${cappedMatched} 个，失败 ${liveFailed} 个${extra}`
-      });
-    }
-  });
+  if (Number.isInteger(tabId)) {
+    const cappedMatched = Math.min(matchedFoundCount, maxImageCount);
+    const liveSorted = matchedEntries.slice().sort((a, b) => a.domIndex - b.domIndex);
+    const liveSelected = liveSorted.slice(0, maxImageCount);
+    const liveFailed = liveSelected.filter((entry) => !entry.embed).length;
+    const liveTruncated = Math.max(0, matchedFoundCount - maxImageCount);
+    const extra = liveTruncated > 0 ? `（已忽略超出 ${liveTruncated} 个）` : '';
+    await showTaskOverlay(tabId, {
+      taskId: message.taskId,
+      status: 'running',
+      text: `已拉取 ${uniqueUrlsForFetch.length} 个链接，展开 ${orderedCandidateUrls.length} 处引用：命中 ${cappedMatched} 个，失败 ${liveFailed} 个${extra}`
+    });
+  }
 
   throwIfCancelled(taskContext);
+  logBg('scan pass done', {
+    taskId: message.taskId,
+    matchedEntriesTotal: matchedEntries.length,
+    truncatedForLimitPreview: Math.max(0, matchedEntries.length - maxImageCount)
+  });
   matchedEntries.sort((a, b) => a.domIndex - b.domIndex);
-  const selectedMatchedEntries = matchedEntries.slice(0, maxImageCount);
-  matchedCount = selectedMatchedEntries.length;
-  truncatedForLimit = Math.max(0, matchedEntries.length - maxImageCount);
-  const failedEmbeds = selectedMatchedEntries.filter((entry) => !entry.embed).map((entry) => entry.sourceUrl);
-  const embedRecords = selectedMatchedEntries
+  const embeddedEntries = matchedEntries.filter((entry) => Boolean(entry.embed));
+  const failedEntries = matchedEntries.filter((entry) => !entry.embed);
+  const uniqueEmbeddedEntries = [];
+  const seenSourceUrls = new Set();
+  for (const entry of embeddedEntries) {
+    const key = String(entry?.sourceUrl || '');
+    if (!key || seenSourceUrls.has(key)) {
+      continue;
+    }
+    seenSourceUrls.add(key);
+    uniqueEmbeddedEntries.push(entry);
+  }
+  const selectedEmbeddedEntries = uniqueEmbeddedEntries.slice(0, maxImageCount);
+  matchedCount = matchedEntries.length;
+  truncatedForLimit = Math.max(0, uniqueEmbeddedEntries.length - maxImageCount);
+  const failedEmbeds = failedEntries.map((entry) => entry.sourceUrl);
+  const embedRecords = selectedEmbeddedEntries
     .filter((entry) => Boolean(entry.embed))
     .map((entry, imageIndex) => {
       const ext = entry.format === 'jpg' ? 'jpg' : entry.format;
@@ -251,10 +359,19 @@ async function handleExportRequest(message, taskContext) {
     fileSize
   }));
 
+  if (finalRecords.length === 0) {
+    const fetchFailHint = failedEntries.length
+      ? '候选图片大多抓取失败、超时，或被源站以 403/防盗链策略拦截。'
+      : '当前筛选条件下没有可内嵌的图片。';
+    throw new Error(
+      `${fetchFailHint} 你可以尝试勾选更多格式、关闭“文件大于”限制、调大“单张超时”，或在目标站点登录后重试。`
+    );
+  }
+
   const htmlText = buildPreviewHtml(finalRecords, layoutColumns);
   const htmlBytes = new TextEncoder().encode(htmlText);
   const approxB64Len = Math.ceil((htmlBytes.length * 4) / 3) + 64;
-  if (approxB64Len > 500 * 1024 * 1024) {
+  if (approxB64Len > 800 * 1024 * 1024) {
     throw new Error(
       '导出体积过大（内嵌图片过多或单张过大）。请缩小范围：减少格式勾选、提高「大于 K」阈值，或分多次导出。'
     );
@@ -266,6 +383,11 @@ async function handleExportRequest(message, taskContext) {
       text: `正在下载 ${matchedCount}/${matchedCount} 个图片，失败 ${failedEmbeds.length} 个`
     });
   }
+  logBg('building html / starting download', {
+    taskId: message.taskId,
+    embedded: finalRecords.length,
+    htmlBytes: htmlBytes.length
+  });
   throwIfCancelled(taskContext);
   const downloadResult = await safeDownloadHtmlWithBlobOffscreen(
     htmlText,
@@ -274,11 +396,13 @@ async function handleExportRequest(message, taskContext) {
   );
 
   if (!downloadResult.ok) {
+    logBg('chrome.downloads failed', downloadResult);
     if (downloadResult.canceled) {
       throw new Error('SAVE_DIALOG_CANCELED');
     }
     throw new Error(downloadResult.error || '导出文件生成失败，请检查下载权限或文件名。');
   }
+  logBg('download ok', { taskId: message.taskId, downloadId: downloadResult.downloadId });
 
   return {
     outputFileName,
@@ -306,8 +430,10 @@ function createTaskContext(taskId) {
 function cancelTask(taskId) {
   const task = ACTIVE_TASKS.get(taskId);
   if (!task) {
+    logBg('cancelTask: no active task', taskId);
     return;
   }
+  logBg('cancelTask: aborting controllers', taskId);
   task.canceled = true;
   task.controllers.forEach((controller) => {
     try {
@@ -485,69 +611,67 @@ async function collectCandidatesFromTab(tabId) {
 }
 
 function collectCandidateUrlsInPage() {
-  const collected = new Set();
-  const srcsetSeparator = /\s*,\s*/;
+  const collected = [];
   const canUse = (url) => /^https?:\/\//i.test(url);
 
-  const addCandidate = (url) => {
-    if (!url) {
+  const addCandidate = (rawUrl) => {
+    if (!rawUrl) {
       return;
     }
-
     try {
-      const absUrl = new URL(url, window.location.href).href;
+      const absUrl = new URL(rawUrl, window.location.href).href;
       if (canUse(absUrl)) {
-        collected.add(absUrl);
+        collected.push(absUrl);
       }
     } catch {
-      // Ignore invalid URLs.
+      // ignore invalid URL
     }
   };
 
-  const addFromSrcSet = (srcsetValue) => {
-    if (!srcsetValue) {
+  const isImageRenderedAndVisible = (img) => {
+    if (!(img instanceof HTMLImageElement)) {
+      return false;
+    }
+    if (!img.isConnected || !img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) {
+      return false;
+    }
+    const style = window.getComputedStyle(img);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') {
+      return false;
+    }
+    const opacity = Number.parseFloat(style.opacity || '1');
+    if (!Number.isNaN(opacity) && opacity <= 0) {
+      return false;
+    }
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    return true;
+  };
+
+  document.querySelectorAll('img').forEach((img) => {
+    if (!isImageRenderedAndVisible(img)) {
       return;
     }
-    srcsetValue
-      .split(srcsetSeparator)
-      .map((item) => item.trim().split(/\s+/)[0])
-      .forEach((url) => addCandidate(url));
-  };
-
-  document.querySelectorAll('img, source').forEach((node) => {
-    addCandidate(node.src);
-    addCandidate(node.getAttribute('data-src'));
-    addCandidate(node.getAttribute('data-original'));
-    addCandidate(node.getAttribute('data-lazy-src'));
-    addCandidate(node.getAttribute('data-gif'));
-    addFromSrcSet(node.srcset);
-    addFromSrcSet(node.getAttribute('srcset'));
-    addFromSrcSet(node.getAttribute('data-srcset'));
+    addCandidate(img.currentSrc);
+    addCandidate(img.src);
   });
 
-  document.querySelectorAll('a[href]').forEach((a) => addCandidate(a.href));
-
-  document.querySelectorAll('[style]').forEach((node) => {
-    const style = node.getAttribute('style') || '';
-    const matches = style.match(/url\((['"]?)(.*?)\1\)/gi) || [];
-    matches.forEach((chunk) => {
-      const url = chunk.replace(/^url\((['"]?)/i, '').replace(/(['"]?)\)$/i, '');
-      addCandidate(url);
-    });
-  });
-
-  return Array.from(collected);
+  return collected;
 }
 
-function getOrCreateTaskCache(cacheMap, key, loader) {
-  if (cacheMap.has(key)) {
-    return cacheMap.get(key);
+/** 首次出现顺序去重，仅用于生成待拉取 URL 列表 */
+function dedupeUrlsFirstSeenOrder(urls) {
+  const out = [];
+  const seen = new Set();
+  for (const url of urls) {
+    if (!seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
   }
-  const pending = Promise.resolve()
-    .then(loader)
-    .catch(() => ({ matched: false, format: null, embed: null }));
-  cacheMap.set(key, pending);
-  return pending;
+  return out;
 }
 
 async function fetchMatchedImageAsDataUrl(
@@ -555,6 +679,7 @@ async function fetchMatchedImageAsDataUrl(
   selectedFormats,
   minSizeBytes,
   maxSingleBytes,
+  httpTimeoutMs,
   taskContext
 ) {
   const byExt = detectFormatByExtension(url);
@@ -566,19 +691,30 @@ async function fetchMatchedImageAsDataUrl(
     if (taskContext?.canceled) {
       return { matched: false, format: null, embed: null };
     }
+    const t0 = Date.now();
     const response = await fetchWithTimeout(
       url,
       {
         method: 'GET',
         redirect: 'follow'
       },
-      300_000,
+      httpTimeoutMs,
       taskContext
     );
+    const connectMs = Date.now() - t0;
     if (response.status === 499) {
+      logBg('fetch canceled', { url: shortUrl(url), connectMs });
+      return { matched: false, format: null, embed: null };
+    }
+    if (response.status === 408) {
+      logBg('fetch http timeout (abort)', { url: shortUrl(url), httpTimeoutMs, connectMs });
+      if (byExt && selectedFormats.includes(byExt)) {
+        return { matched: true, format: byExt, embed: null };
+      }
       return { matched: false, format: null, embed: null };
     }
     if (!response.ok) {
+      logFetchNotOkThrottled(url, response.status, connectMs);
       if (byExt && selectedFormats.includes(byExt)) {
         return { matched: true, format: byExt, embed: null };
       }
@@ -603,23 +739,36 @@ async function fetchMatchedImageAsDataUrl(
     }
 
     const mimeType = FORMAT_TO_MIME[format] || contentType || 'application/octet-stream';
+    const dataUrl = `data:${mimeType};base64,${await encodeArrayBufferToBase64(bytes)}`;
+    logBg('embedded asset', {
+      url: shortUrl(url),
+      format,
+      byteLength: bytes.byteLength,
+      totalMs: Date.now() - t0
+    });
     return {
       matched: true,
       format,
       embed: {
         byteLength: bytes.byteLength,
-        dataUrl: `data:${mimeType};base64,${await encodeArrayBufferToBase64(bytes)}`
+        dataUrl
       }
     };
-  } catch {
+  } catch (err) {
     if (taskContext?.canceled) {
       return { matched: false, format: null, embed: null };
     }
+    logBg('fetchMatched error', { url: shortUrl(url), err: err?.message || String(err) });
     if (byExt && selectedFormats.includes(byExt)) {
       return { matched: true, format: byExt, embed: null };
     }
     return { matched: false, format: null, embed: null };
   }
+}
+
+function shortUrl(url) {
+  const s = String(url || '');
+  return s.length > 160 ? `${s.slice(0, 160)}…` : s;
 }
 
 function detectFormatByExtension(url) {
@@ -718,6 +867,15 @@ function normalizeMaxSingleImageKB(value) {
   return Math.min(num, 512 * 1024);
 }
 
+/** 与 popup 一致：单次 HTTP 连接阶段超时（分钟），1–30，默认 1 */
+function normalizeHttpTimeoutMinutes(value) {
+  const num = Number.parseInt(String(value), 10);
+  if (Number.isNaN(num) || num < 1) {
+    return 1;
+  }
+  return Math.min(num, 30);
+}
+
 async function fetchWithTimeout(url, init, timeoutMs, taskContext) {
   if (taskContext?.canceled) {
     return new Response(null, { status: 499, statusText: 'Canceled' });
@@ -759,6 +917,7 @@ async function safeDownload(url, filename, askUserForPath = false) {
 
 async function safeDownloadHtmlWithBlobOffscreen(htmlText, filename, askUserForPath = false) {
   const exportId = `export_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  logBg('offscreen export begin', { exportId, filename, htmlLen: htmlText.length });
   const htmlBlob = new Blob([htmlText], { type: 'text/html;charset=utf-8' });
   await pruneExpiredExportRecords();
   await putPendingExportBlob(exportId, htmlBlob);
@@ -771,6 +930,7 @@ async function safeDownloadHtmlWithBlobOffscreen(htmlText, filename, askUserForP
       exportId
     });
     if (!blobResp?.ok || !blobResp?.blobUrl) {
+      logBg('offscreen blob url failed', blobResp);
       return {
         ok: false,
         canceled: false,
@@ -778,6 +938,7 @@ async function safeDownloadHtmlWithBlobOffscreen(htmlText, filename, askUserForP
       };
     }
     blobUrl = String(blobResp.blobUrl);
+    logBg('blob url created', { exportId, blobUrlPrefix: blobUrl.slice(0, 32) });
     const downloadResult = await safeDownload(blobUrl, filename, askUserForPath);
     if (downloadResult.ok && Number.isInteger(downloadResult.downloadId)) {
       DOWNLOAD_EXPORT_CLEANUPS.set(downloadResult.downloadId, exportId);
@@ -913,33 +1074,20 @@ async function ensureWasmEncoderReady() {
   await wasmInitPromise;
 }
 
+/** 与 runWithConcurrency 的某一路同一调用栈延续：不在此排队到别的路上 */
 async function encodeArrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
-  return enqueueExclusiveEncoding(async () => {
-    await ensureWasmEncoderReady();
-    try {
-      return encodeWithWasmChunked(bytes);
-    } catch (error) {
-      const msg = error?.message || String(error);
-      throw new Error(`WASM_BASE64_ENCODE_FAILED: ${msg}`);
-    }
-  });
-}
-
-function enqueueExclusiveEncoding(task) {
-  const startTask = () => Promise.resolve().then(task);
-  const runWhenAvailable = () => {
-    if (activeEncodingCount < MAX_CONCURRENT_ENCODINGS) {
-      activeEncodingCount += 1;
-      return startTask().finally(() => {
-        activeEncodingCount -= 1;
-      });
-    }
-    return encodingQueueTail.then(runWhenAvailable);
-  };
-  const pending = runWhenAvailable();
-  encodingQueueTail = pending.catch(() => {});
-  return pending;
+  const encStart = Date.now();
+  logBg('base64 encode start', { bytes: bytes.length });
+  await ensureWasmEncoderReady();
+  try {
+    const b64 = encodeWithWasmChunked(bytes);
+    logBg('base64 encode done', { bytes: bytes.length, ms: Date.now() - encStart });
+    return b64;
+  } catch (error) {
+    const msg = error?.message || String(error);
+    throw new Error(`WASM_BASE64_ENCODE_FAILED: ${msg}`);
+  }
 }
 
 function encodeWithWasm(bytes) {
